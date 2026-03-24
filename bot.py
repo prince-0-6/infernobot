@@ -52,7 +52,6 @@ def init_db():
         )
         """)
 
-        # store users for broadcasting
         c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -60,7 +59,6 @@ def init_db():
         )
         """)
 
-        # DB mein add karo init_db() ke andar
         c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -89,8 +87,7 @@ def get_owner():
     with db() as conn:
         r = conn.execute("SELECT user_id FROM admins WHERE role='owner'").fetchone()
         return r[0] if r else None
-    
-# Helper functions add karo
+
 def get_setting(key: str, default: str = "") -> str:
     with db() as conn:
         r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -112,16 +109,9 @@ def save_user(uid: int):
         )
 
 def build_channel_keyboard(channels, columns: int = 2):
-    """
-    Build inline keyboard like:
-    [CH1][CH2]
-    [CH3][CH4]
-    ...
-    """
     keyboard = []
     row = []
     for n, l in channels:
-        # button text style like in screenshot
         row.append(InlineKeyboardButton(f"CHANNEL {n}", url=l))
         if len(row) == columns:
             keyboard.append(row)
@@ -133,7 +123,13 @@ def build_channel_keyboard(channels, columns: int = 2):
 # ================= FORCE JOIN =================
 async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
-    for _, link in get_channels():
+    channels = get_channels()
+
+    # ✅ FIX: Agar koi channel nahi hai toh False return karo
+    if not channels:
+        return False
+
+    for _, link in channels:
         try:
             username = link.split("/")[-1].replace("@", "").strip()
             member = await context.bot.get_chat_member(f"@{username}", uid)
@@ -144,7 +140,6 @@ async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
             return False
     return True
 
-# force_join function replace karo
 async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels = get_channels()
     keyboard = build_channel_keyboard(channels, columns=2)
@@ -264,8 +259,7 @@ async def channel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = build_channel_keyboard(get_channels(), columns=2)
     await update.message.reply_text("📺 Join:", reply_markup=InlineKeyboardMarkup(kb))
 
-
-# Nayi commands — sirf admin/owner use kar sake
+# ================= SET MSG / IMAGE =================
 async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -286,7 +280,7 @@ async def set_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("force_image", url)
     await update.message.reply_text("✅ Image URL saved!")
 
-# ================= BROADCAST (TO USERS) =================
+# ================= BROADCAST =================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -366,7 +360,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         us = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
     await update.message.reply_text(
-        f"Channels: {ch}\nAdmins: {ad}\nUsers: {us}\nBroadcasts: {br}"
+        f"📊 Bot Stats\n\n"
+        f"📺 Channels: {ch}\n"
+        f"👮 Admins: {ad}\n"
+        f"👥 Users: {us}\n"
+        f"📢 Broadcasts: {br}"
     )
 
 # ================= MAIN =================
