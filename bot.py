@@ -88,7 +88,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <p class="info">
     Bot is running smoothly<br>
     All systems operational<br><br>
-    &copy; 2025 &mdash; All rights reserved
+    &copy; 2026 &mdash; All rights reserved @aerivue
   </p>
 </div>
 </body>
