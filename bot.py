@@ -1,0 +1,398 @@
+import logging
+import sqlite3
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes,
+    CallbackQueryHandler
+)
+
+# ================= CONFIG =================
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN missing in .env")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+DB = "bot.db"
+
+# ================= DATABASE =================
+def db():
+    return sqlite3.connect(DB)
+
+def init_db():
+    with db() as conn:
+        c = conn.cursor()
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            number INTEGER UNIQUE,
+            link TEXT,
+            active INTEGER DEFAULT 1
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            role TEXT
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            message TEXT,
+            date TEXT
+        )
+        """)
+
+        # store users for broadcasting
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_seen TEXT
+        )
+        """)
+
+        # DB mein add karo init_db() ke andar
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+# ================= HELPERS =================
+def get_channels():
+    with db() as conn:
+        return conn.execute(
+            "SELECT number, link FROM channels WHERE active=1 ORDER BY number ASC"
+        ).fetchall()
+
+def is_admin(uid: int) -> bool:
+    with db() as conn:
+        r = conn.execute("SELECT role FROM admins WHERE user_id=?", (uid,)).fetchone()
+        return r is not None
+
+def is_owner(uid: int) -> bool:
+    with db() as conn:
+        r = conn.execute("SELECT role FROM admins WHERE user_id=?", (uid,)).fetchone()
+        return bool(r and r[0] == "owner")
+
+def get_owner():
+    with db() as conn:
+        r = conn.execute("SELECT user_id FROM admins WHERE role='owner'").fetchone()
+        return r[0] if r else None
+    
+# Helper functions add karo
+def get_setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+def set_setting(key: str, value: str):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
+
+def add_owner(uid: int):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO admins VALUES (?,?)", (uid, "owner"))
+
+def save_user(uid: int):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?, ?)",
+            (uid, datetime.now().isoformat())
+        )
+
+def build_channel_keyboard(channels, columns: int = 2):
+    """
+    Build inline keyboard like:
+    [CH1][CH2]
+    [CH3][CH4]
+    ...
+    """
+    keyboard = []
+    row = []
+    for n, l in channels:
+        # button text style like in screenshot
+        row.append(InlineKeyboardButton(f"CHANNEL {n}", url=l))
+        if len(row) == columns:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    return keyboard
+
+# ================= FORCE JOIN =================
+async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    for _, link in get_channels():
+        try:
+            username = link.split("/")[-1].replace("@", "").strip()
+            member = await context.bot.get_chat_member(f"@{username}", uid)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception as e:
+            logger.warning("join check failed for link=%s uid=%s err=%s", link, uid, e)
+            return False
+    return True
+
+# force_join function replace karo
+async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channels = get_channels()
+    keyboard = build_channel_keyboard(channels, columns=2)
+    keyboard.append([InlineKeyboardButton("CHECK JOINED ✅", callback_data="check")])
+    markup = InlineKeyboardMarkup(keyboard)
+
+    msg_text = get_setting("force_msg", "🚫 Join all channels first!")
+    image_url = get_setting("force_image", "")
+
+    if image_url:
+        await update.message.reply_photo(
+            photo=image_url,
+            caption=msg_text,
+            reply_markup=markup
+        )
+    else:
+        await update.message.reply_text(msg_text, reply_markup=markup)
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+
+    # admins bypass join check
+    if is_admin(uid):
+        return True
+
+    if not await is_joined_all(update, context):
+        await force_join(update, context)
+        return False
+
+    return True
+
+# ================= START =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    save_user(uid)
+
+    # first user becomes owner
+    if get_owner() is None:
+        add_owner(uid)
+        await update.message.reply_text("👑 You are OWNER")
+        return
+
+    if not await guard(update, context):
+        return
+
+    if is_admin(uid):
+        await update.message.reply_text("⚙️ Admin Panel Ready")
+    else:
+        await update.message.reply_text("✅ Access Granted")
+
+# ================= CALLBACK =================
+async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if await is_joined_all(update, context):
+        await q.edit_message_text("✅ Verified! Use /start")
+    else:
+        await q.answer("❌ Join all channels!", show_alert=True)
+
+# ================= CHANNEL =================
+async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    try:
+        n = int(context.args[0])
+        l = context.args[1]
+
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO channels VALUES (?,?,1)", (n, l))
+
+        await update.message.reply_text("✅ Added")
+
+    except Exception:
+        await update.message.reply_text("❌ Usage: /add 1 https://t.me/yourchannel")
+
+async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    try:
+        n = int(context.args[0])
+        with db() as conn:
+            conn.execute("UPDATE channels SET active=0 WHERE number=?", (n,))
+        await update.message.reply_text("✅ Removed")
+    except Exception:
+        await update.message.reply_text("❌ Usage: /remove 1")
+
+async def update_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    try:
+        n = int(context.args[0])
+        l = context.args[1]
+
+        with db() as conn:
+            conn.execute("UPDATE channels SET link=? WHERE number=?", (l, n))
+
+        await update.message.reply_text("✅ Updated")
+    except Exception:
+        await update.message.reply_text("❌ Usage: /update 1 https://t.me/newlink")
+
+async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+
+    ch = get_channels()
+    msg = "\n".join([f"{n} → {l}" for n, l in ch]) or "No channels"
+    await update.message.reply_text(msg)
+
+async def channel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+
+    kb = build_channel_keyboard(get_channels(), columns=2)
+    await update.message.reply_text("📺 Join:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+# Nayi commands — sirf admin/owner use kar sake
+async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    msg = " ".join(context.args).strip()
+    if not msg:
+        await update.message.reply_text("❌ Usage: /setmsg Your message here")
+        return
+    set_setting("force_msg", msg)
+    await update.message.reply_text(f"✅ Message set:\n{msg}")
+
+async def set_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    url = " ".join(context.args).strip()
+    if not url:
+        await update.message.reply_text("❌ Usage: /setimage https://...")
+        return
+    set_setting("force_image", url)
+    await update.message.reply_text("✅ Image URL saved!")
+
+# ================= BROADCAST (TO USERS) =================
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    msg = " ".join(context.args).strip()
+    if not msg:
+        await update.message.reply_text("❌ Usage: /broadcast your message")
+        return
+
+    with db() as conn:
+        user_rows = conn.execute("SELECT user_id FROM users").fetchall()
+
+    success, fail = 0, 0
+    for (uid,) in user_rows:
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg)
+            success += 1
+        except Exception as e:
+            logger.warning("broadcast failed uid=%s err=%s", uid, e)
+            fail += 1
+
+    with db() as conn:
+        conn.execute("INSERT INTO broadcasts VALUES (?,?)", (msg, datetime.now().isoformat()))
+
+    await update.message.reply_text(f"✅ Sent: {success}\n❌ Fail: {fail}")
+
+# ================= ADMIN =================
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    try:
+        uid = int(context.args[0])
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO admins VALUES (?,?)", (uid, "admin"))
+
+        await update.message.reply_text("✅ Admin added")
+    except Exception:
+        await update.message.reply_text("❌ Usage: /addadmin user_id")
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    try:
+        uid = int(context.args[0])
+        if is_owner(uid):
+            return
+
+        with db() as conn:
+            conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+
+        await update.message.reply_text("✅ Removed")
+    except Exception:
+        await update.message.reply_text("❌ Usage: /removeadmin user_id")
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM admins").fetchall()
+
+    msg = "\n".join([f"{u} → {r}" for u, r in rows])
+    await update.message.reply_text(msg or "No admins")
+
+# ================= STATS =================
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    with db() as conn:
+        c = conn.cursor()
+        ch = c.execute("SELECT COUNT(*) FROM channels WHERE active=1").fetchone()[0]
+        ad = c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
+        br = c.execute("SELECT COUNT(*) FROM broadcasts").fetchone()[0]
+        us = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    await update.message.reply_text(
+        f"Channels: {ch}\nAdmins: {ad}\nUsers: {us}\nBroadcasts: {br}"
+    )
+
+# ================= MAIN =================
+def main():
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add_channel))
+    app.add_handler(CommandHandler("remove", remove_channel))
+    app.add_handler(CommandHandler("update", update_channel))
+    app.add_handler(CommandHandler("list", list_channels))
+    app.add_handler(CommandHandler("channels", channel_buttons))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("addadmin", add_admin))
+    app.add_handler(CommandHandler("removeadmin", remove_admin))
+    app.add_handler(CommandHandler("admins", list_admins))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("setmsg", set_message))
+    app.add_handler(CommandHandler("setimage", set_image))
+
+    app.add_handler(CallbackQueryHandler(check_join, pattern="check"))
+
+    print("🤖 Running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
