@@ -3,6 +3,8 @@ import sqlite3
 import os
 from datetime import datetime
 from dotenv import load_dotenv
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,6 +23,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DB = "bot.db"
+
+# ================= SIMPLE HTTP SERVER =================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress HTTP server logs
+        pass
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"Health check server running on port {port}")
+    server.serve_forever()
 
 # ================= DATABASE =================
 def db():
@@ -125,7 +149,6 @@ async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     uid = update.effective_user.id
     channels = get_channels()
 
-    # ✅ FIX: Agar koi channel nahi hai toh False return karo
     if not channels:
         return False
 
@@ -161,7 +184,6 @@ async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
 
-    # admins bypass join check
     if is_admin(uid):
         return True
 
@@ -176,7 +198,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     save_user(uid)
 
-    # first user becomes owner
     if get_owner() is None:
         add_owner(uid)
         await update.message.reply_text("👑 You are OWNER")
@@ -389,6 +410,10 @@ def main():
 
     app.add_handler(CallbackQueryHandler(check_join, pattern="check"))
 
+    # Start health check server in a separate thread
+    health_thread = Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    
     print("🤖 Running...")
     app.run_polling()
 
