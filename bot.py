@@ -175,7 +175,7 @@ def save_user(uid: int):
 def build_channel_keyboard(channels, columns: int = 2):
     keyboard, row = [], []
     for n, l in channels:
-        row.append(InlineKeyboardButton(f"CHANNEL {n}", url=l))
+        row.append(InlineKeyboardButton(f"𝐂𝐇𝐀𝐍𝐍𝐄𝐋 {n}", url=l))
         if len(row) == columns:
             keyboard.append(row)
             row = []
@@ -202,7 +202,10 @@ async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels = get_channels()
     keyboard = build_channel_keyboard(channels, columns=2)
-    keyboard.append([InlineKeyboardButton("CHECK JOINED", callback_data="check")])
+    # keyboard.append([InlineKeyboardButton("𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅", callback_data="check")])
+    InlineKeyboardButton(
+    "𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅",
+    url="https://t.me/+U7N9wRhh6EtmOWM1")
     markup = InlineKeyboardMarkup(keyboard)
     msg_text = get_setting("force_msg", "Join all channels first!")
     image_url = get_setting("force_image", "")
