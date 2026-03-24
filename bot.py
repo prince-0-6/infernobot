@@ -5,7 +5,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,37 +15,96 @@ from telegram.ext import (
 # ================= CONFIG =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_SECRET = os.getenv("OWNER_SECRET")
+PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN missing in .env")
+if not OWNER_SECRET:
+    raise ValueError("OWNER_SECRET missing in .env")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 DB = "bot.db"
 
-# ================= HEALTH CHECK SERVER =================
-class HealthCheckHandler(BaseHTTPRequestHandler):
+# ================= WEB SERVER =================
+class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/health' or self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = json.dumps({"status": "ok", "message": "Bot is running"})
-            self.wfile.write(response.encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        # Suppress HTTP server logs to avoid clutter
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        html = b"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bot Status</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Segoe UI', sans-serif; color: white;
+  }
+  .card {
+    background: rgba(255,255,255,0.07);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 24px;
+    padding: 50px 60px;
+    text-align: center;
+    max-width: 480px; width: 90%;
+    box-shadow: 0 30px 60px rgba(0,0,0,0.4);
+  }
+  .dot {
+    width: 16px; height: 16px;
+    background: #00ff88; border-radius: 50%;
+    display: inline-block; margin-right: 8px;
+    vertical-align: middle;
+    animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(0,255,136,0.5); }
+    50% { box-shadow: 0 0 0 10px rgba(0,255,136,0); }
+  }
+  h1 { font-size: 2.2rem; margin-bottom: 8px; letter-spacing: 1px; }
+  .sub { color: rgba(255,255,255,0.45); font-size: 0.9rem; margin-bottom: 36px; }
+  .badge {
+    display: inline-block;
+    background: rgba(0,255,136,0.12);
+    border: 1px solid rgba(0,255,136,0.35);
+    color: #00ff88;
+    border-radius: 50px;
+    padding: 10px 28px;
+    font-size: 1rem; font-weight: 600;
+    letter-spacing: 1px;
+    margin-bottom: 30px;
+  }
+  .info { color: rgba(255,255,255,0.35); font-size: 0.82rem; line-height: 1.8; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🤖 Telegram Bot</h1>
+  <p class="sub">Powered by python-telegram-bot</p>
+  <div class="badge"><span class="dot"></span>ONLINE &amp; ACTIVE</div>
+  <p class="info">
+    Bot is running smoothly<br>
+    All systems operational<br><br>
+    &copy; 2025 &mdash; All rights reserved
+  </p>
+</div>
+</body>
+</html>"""
+        self.wfile.write(html)
+
+    def log_message(self, *args):
         pass
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f"✅ Health check server running on port {port}")
-    server.serve_forever()
+def run_web_server():
+    HTTPServer(("0.0.0.0", PORT), WebHandler).serve_forever()
 
 # ================= DATABASE =================
 def db():
@@ -55,44 +113,21 @@ def db():
 def init_db():
     with db() as conn:
         c = conn.cursor()
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS channels (
-            number INTEGER UNIQUE,
-            link TEXT,
-            active INTEGER DEFAULT 1
-        )
-        """)
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            role TEXT
-        )
-        """)
-
-        c.execute("""  
-        CREATE TABLE IF NOT EXISTS broadcasts (
-            message TEXT,
-            date TEXT
-        )
-        """)
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_seen TEXT
-        )
-        """)
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
-        
-        logger.info("✅ Database initialized")
+        c.execute("""CREATE TABLE IF NOT EXISTS channels (
+            number INTEGER UNIQUE, link TEXT, active INTEGER DEFAULT 1
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY, role TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcasts (
+            message TEXT, date TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, first_seen TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT
+        )""")
 
 # ================= HELPERS =================
 def get_channels():
@@ -132,15 +167,14 @@ def add_owner(uid: int):
 def save_user(uid: int):
     with db() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?,?)",
             (uid, datetime.now().isoformat())
         )
 
 def build_channel_keyboard(channels, columns: int = 2):
-    keyboard = []
-    row = []
+    keyboard, row = [], []
     for n, l in channels:
-        row.append(InlineKeyboardButton(f"📢 CHANNEL {n}", url=l))
+        row.append(InlineKeyboardButton(f"CHANNEL {n}", url=l))
         if len(row) == columns:
             keyboard.append(row)
             row = []
@@ -152,18 +186,15 @@ def build_channel_keyboard(channels, columns: int = 2):
 async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
     channels = get_channels()
-
     if not channels:
         return False
-
     for _, link in channels:
         try:
             username = link.split("/")[-1].replace("@", "").strip()
             member = await context.bot.get_chat_member(f"@{username}", uid)
             if member.status in ["left", "kicked"]:
                 return False
-        except Exception as e:
-            logger.warning(f"Join check failed for {link}: {e}")
+        except Exception:
             return False
     return True
 
@@ -172,151 +203,164 @@ async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = build_channel_keyboard(channels, columns=2)
     keyboard.append([InlineKeyboardButton("✅ CHECK JOINED", callback_data="check")])
     markup = InlineKeyboardMarkup(keyboard)
-
-    msg_text = get_setting("force_msg", "🚫 Please join all channels first to use this bot!")
+    msg_text = get_setting("force_msg", "🚫 Join all channels first!")
     image_url = get_setting("force_image", "")
-
     if image_url:
-        await update.message.reply_photo(
-            photo=image_url,
-            caption=msg_text,
-            reply_markup=markup
-        )
+        await update.message.reply_photo(photo=image_url, caption=msg_text, reply_markup=markup)
     else:
         await update.message.reply_text(msg_text, reply_markup=markup)
 
 async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
-
     if is_admin(uid):
         return True
-
     if not await is_joined_all(update, context):
         await force_join(update, context)
         return False
-
     return True
 
-# ================= COMMANDS =================
+# ================= /owner =================
+async def owner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if get_owner() is not None:
+        if is_owner(uid):
+            await update.message.reply_text("👑 You are already the OWNER!")
+        else:
+            await update.message.reply_text("❌ Owner is already set.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("🔐 Usage: /owner <secret_password>")
+        return
+
+    secret = context.args[0].strip()
+    if secret != OWNER_SECRET:
+        await update.message.reply_text("❌ Wrong secret! Access denied.")
+        return
+
+    add_owner(uid)
+    name = update.effective_user.first_name or "Owner"
+    await update.message.reply_text(
+        f"👑 Welcome, *{name}*!\n\n"
+        f"You are now the OWNER of this bot.\n"
+        f"Use /start to see all commands.",
+        parse_mode="Markdown"
+    )
+
+# ================= /start =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     save_user(uid)
 
-    # first user becomes owner
     if get_owner() is None:
-        add_owner(uid)
-        await update.message.reply_text("👑 You are now the OWNER of this bot!")
+        await update.message.reply_text(
+            "⚙️ Bot not configured yet.\n\n"
+            "Owner must run: /owner <secret_password>"
+        )
         return
 
     if not await guard(update, context):
         return
 
-    if is_admin(uid):
+    if is_owner(uid):
         await update.message.reply_text(
-            "⚙️ **Admin Panel Ready**\n\n"
-            "Available commands:\n"
-            "/add - Add channel\n"
-            "/remove - Remove channel\n"
-            "/update - Update channel\n"
-            "/list - List channels\n"
-            "/broadcast - Send broadcast\n"
-            "/setmsg - Set force message\n"
-            "/setimage - Set force image\n"
-            "/stats - View stats",
-            parse_mode='Markdown'
+            "👑 *Owner Panel*\n\n"
+            "/add — Add channel\n"
+            "/remove — Remove channel\n"
+            "/update — Update channel link\n"
+            "/list — List channels\n"
+            "/broadcast — Broadcast to all users\n"
+            "/setmsg — Set force join message\n"
+            "/setimage — Set force join image\n"
+            "/addadmin — Add admin\n"
+            "/removeadmin — Remove admin\n"
+            "/admins — List admins\n"
+            "/stats — Bot statistics",
+            parse_mode="Markdown"
+        )
+    elif is_admin(uid):
+        await update.message.reply_text(
+            "⚙️ *Admin Panel*\n\n"
+            "/add — Add channel\n"
+            "/remove — Remove channel\n"
+            "/update — Update channel link\n"
+            "/list — List channels\n"
+            "/broadcast — Broadcast to all users\n"
+            "/setmsg — Set force join message\n"
+            "/setimage — Set force join image\n"
+            "/stats — Bot statistics",
+            parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("✅ Access Granted! You can now use the bot.")
+        await update.message.reply_text("✅ Access Granted!")
 
+# ================= CALLBACK =================
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     if await is_joined_all(update, context):
-        await q.edit_message_text("✅ **Verified!**\nUse /start to continue.", parse_mode='Markdown')
+        await q.edit_message_text("✅ Verified! Use /start to continue.")
     else:
-        await q.answer("❌ Please join all channels first!", show_alert=True)
+        await q.answer("❌ Join all channels first!", show_alert=True)
 
 # ================= CHANNEL MANAGEMENT =================
 async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ You are not authorized!")
         return
-
     try:
-        if len(context.args) < 2:
-            raise ValueError
         n = int(context.args[0])
         l = context.args[1]
-
         with db() as conn:
             conn.execute("INSERT OR REPLACE INTO channels VALUES (?,?,1)", (n, l))
-
-        await update.message.reply_text(f"✅ Channel {n} added successfully!")
-        logger.info(f"Channel {n} added by {update.effective_user.id}")
-
+        await update.message.reply_text(f"✅ Channel {n} added!")
     except Exception:
-        await update.message.reply_text("❌ Usage: /add <number> <channel_link>\nExample: /add 1 https://t.me/yourchannel")
+        await update.message.reply_text("❌ Usage: /add 1 https://t.me/yourchannel")
 
 async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     try:
         n = int(context.args[0])
         with db() as conn:
             conn.execute("UPDATE channels SET active=0 WHERE number=?", (n,))
         await update.message.reply_text(f"✅ Channel {n} removed!")
-        logger.info(f"Channel {n} removed by {update.effective_user.id}")
     except Exception:
-        await update.message.reply_text("❌ Usage: /remove <number>")
+        await update.message.reply_text("❌ Usage: /remove 1")
 
 async def update_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     try:
-        if len(context.args) < 2:
-            raise ValueError
         n = int(context.args[0])
         l = context.args[1]
-
         with db() as conn:
             conn.execute("UPDATE channels SET link=?, active=1 WHERE number=?", (l, n))
-
         await update.message.reply_text(f"✅ Channel {n} updated!")
     except Exception:
-        await update.message.reply_text("❌ Usage: /update <number> <new_link>")
+        await update.message.reply_text("❌ Usage: /update 1 https://t.me/newlink")
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context):
         return
-
     ch = get_channels()
     if not ch:
-        await update.message.reply_text("📭 No channels configured yet.")
+        await update.message.reply_text("📭 No channels added yet.")
         return
-    
-    msg = "📺 **Active Channels:**\n\n"
+    msg = "📺 *Active Channels:*\n\n"
     for n, l in ch:
         msg += f"`{n}` → {l}\n"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def channel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context):
         return
-
     ch = get_channels()
     if not ch:
         await update.message.reply_text("📭 No channels available.")
         return
-
     kb = build_channel_keyboard(ch, columns=2)
-    await update.message.reply_text(
-        "📺 **Join our channels:**\n\nClick the buttons below to join!",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("📺 Join our channels:", reply_markup=InlineKeyboardMarkup(kb))
 
 # ================= SETTINGS =================
 async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,56 +368,46 @@ async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = " ".join(context.args).strip()
     if not msg:
-        await update.message.reply_text("❌ Usage: /setmsg <your message>")
+        await update.message.reply_text("❌ Usage: /setmsg Your message here")
         return
     set_setting("force_msg", msg)
-    await update.message.reply_text(f"✅ Force join message set!\n\n{msg}")
+    await update.message.reply_text(f"✅ Force message updated!\n\n{msg}")
 
 async def set_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     url = " ".join(context.args).strip()
     if not url:
-        await update.message.reply_text("❌ Usage: /setimage <image_url>")
+        await update.message.reply_text("❌ Usage: /setimage https://...")
         return
     set_setting("force_image", url)
-    await update.message.reply_text("✅ Force join image set!")
+    await update.message.reply_text("✅ Force image updated!")
 
 # ================= BROADCAST =================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     msg = " ".join(context.args).strip()
     if not msg:
-        await update.message.reply_text("❌ Usage: /broadcast <your message>")
+        await update.message.reply_text("❌ Usage: /broadcast your message")
         return
-
-    await update.message.reply_text("📢 Broadcasting started...")
-    
     with db() as conn:
         user_rows = conn.execute("SELECT user_id FROM users").fetchall()
-
     success, fail = 0, 0
     for (uid,) in user_rows:
         try:
             await context.bot.send_message(chat_id=uid, text=msg)
             success += 1
-        except Exception as e:
-            logger.warning(f"Broadcast failed to {uid}: {e}")
+        except Exception:
             fail += 1
-
     with db() as conn:
         conn.execute("INSERT INTO broadcasts VALUES (?,?)", (msg, datetime.now().isoformat()))
-
-    await update.message.reply_text(f"✅ **Broadcast Complete**\n\n✅ Sent: {success}\n❌ Failed: {fail}", parse_mode='Markdown')
+    await update.message.reply_text(f"📢 Broadcast done!\n\n✅ Sent: {success}\n❌ Failed: {fail}")
 
 # ================= ADMIN MANAGEMENT =================
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owner can add admins!")
         return
-
     try:
         uid = int(context.args[0])
         with db() as conn:
@@ -385,13 +419,11 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
-
     try:
         uid = int(context.args[0])
         if is_owner(uid):
             await update.message.reply_text("❌ Cannot remove owner!")
             return
-
         with db() as conn:
             conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
         await update.message.reply_text(f"✅ Admin {uid} removed!")
@@ -401,54 +433,44 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     with db() as conn:
         rows = conn.execute("SELECT user_id, role FROM admins").fetchall()
-
     if not rows:
         await update.message.reply_text("No admins found.")
         return
-
-    msg = "👥 **Admins List:**\n\n"
+    msg = "👥 *Admins:*\n\n"
     for uid, role in rows:
         msg += f"• `{uid}` → {role.upper()}\n"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 # ================= STATS =================
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
-
     with db() as conn:
         c = conn.cursor()
         ch = c.execute("SELECT COUNT(*) FROM channels WHERE active=1").fetchone()[0]
         ad = c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
         br = c.execute("SELECT COUNT(*) FROM broadcasts").fetchone()[0]
         us = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-
     await update.message.reply_text(
-        f"📊 **Bot Statistics**\n\n"
-        f"📺 Active Channels: {ch}\n"
+        f"📊 *Bot Stats*\n\n"
+        f"📺 Channels: {ch}\n"
         f"👮 Admins: {ad}\n"
-        f"👥 Total Users: {us}\n"
-        f"📢 Broadcasts Sent: {br}\n"
-        f"🤖 Status: 🟢 Online",
-        parse_mode='Markdown'
+        f"👥 Users: {us}\n"
+        f"📢 Broadcasts: {br}\n"
+        f"🟢 Status: Online",
+        parse_mode="Markdown"
     )
 
 # ================= MAIN =================
 def main():
-    # Initialize database
     init_db()
-    
-    # Start health check server in background thread
-    health_thread = Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-    
-    # Build application
+    Thread(target=run_web_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
+
+    app.add_handler(CommandHandler("owner", owner_cmd))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_channel))
     app.add_handler(CommandHandler("remove", remove_channel))
@@ -462,13 +484,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("setmsg", set_message))
     app.add_handler(CommandHandler("setimage", set_image))
-    
     app.add_handler(CallbackQueryHandler(check_join, pattern="check"))
-    
-    logger.info("🤖 Bot started! Running with polling...")
-    logger.info(f"Health check available at: http://localhost:{os.environ.get('PORT', 10000)}/health")
-    
-    # Start polling
+
     app.run_polling()
 
 if __name__ == "__main__":
