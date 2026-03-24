@@ -203,9 +203,9 @@ async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels = get_channels()
     keyboard = build_channel_keyboard(channels, columns=2)
     # keyboard.append([InlineKeyboardButton("𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅", callback_data="check")])
-    InlineKeyboardButton(
+    keyboard.append([InlineKeyboardButton(
     "𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅",
-    url="https://t.me/+U7N9wRhh6EtmOWM1")
+    url="https://t.me/+U7N9wRhh6EtmOWM1")])
     markup = InlineKeyboardMarkup(keyboard)
     msg_text = get_setting("force_msg", "Join all channels first!")
     image_url = get_setting("force_image", "")
