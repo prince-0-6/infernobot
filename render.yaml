@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+```
+
+> **Worker service use karo** — Web Service nahi! Kyunki bot ko koi HTTP port nahi chahiye.
+
+---
+
+**3. Render pe Deploy karo**
+
+- GitHub pe code push karo
+- Render.com → **New → Background Worker**
+- Environment variable add karo:
+```
+  BOT_TOKEN = your_token_here
