@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ================= MONGODB SETUP =================
 mongo_client = MongoClient(MONGO_URI)
-mongo_db = mongo_client.get_default_database()  # uses DB name from URI
+mongo_db = mongo_client["botdb"]
 
 channels_col   = mongo_db["channels"]
 admins_col     = mongo_db["admins"]
