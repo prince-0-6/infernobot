@@ -1,5 +1,4 @@
 import logging
-import sqlite3
 import os
 from datetime import datetime
 from dotenv import load_dotenv
@@ -12,21 +11,41 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 
+from pymongo import MongoClient
+
 # ================= CONFIG =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_SECRET = os.getenv("OWNER_SECRET")
+MONGO_URI = os.getenv("MONGO_URI")  # e.g. mongodb+srv://user:pass@cluster.mongodb.net/botdb
 PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN missing in .env")
 if not OWNER_SECRET:
     raise ValueError("OWNER_SECRET missing in .env")
+if not MONGO_URI:
+    raise ValueError("MONGO_URI missing in .env")
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-DB = "bot.db"
+# ================= MONGODB SETUP =================
+mongo_client = MongoClient(MONGO_URI)
+mongo_db = mongo_client.get_default_database()  # uses DB name from URI
+
+channels_col   = mongo_db["channels"]
+admins_col     = mongo_db["admins"]
+broadcasts_col = mongo_db["broadcasts"]
+users_col      = mongo_db["users"]
+settings_col   = mongo_db["settings"]
+
+def init_db():
+    """Create indexes for fast lookups."""
+    channels_col.create_index("number", unique=True)
+    admins_col.create_index("user_id", unique=True)
+    users_col.create_index("user_id", unique=True)
+    settings_col.create_index("key", unique=True)
 
 # ================= WEB SERVER =================
 HTML_PAGE = """<!DOCTYPE html>
@@ -107,70 +126,39 @@ class WebHandler(BaseHTTPRequestHandler):
 def run_web_server():
     HTTPServer(("0.0.0.0", PORT), WebHandler).serve_forever()
 
-# ================= DATABASE =================
-def db():
-    return sqlite3.connect(DB)
-
-def init_db():
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS channels (
-            number INTEGER UNIQUE, link TEXT, active INTEGER DEFAULT 1
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY, role TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS broadcasts (
-            message TEXT, date TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, first_seen TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT
-        )""")
-
 # ================= HELPERS =================
 def get_channels():
-    with db() as conn:
-        return conn.execute(
-            "SELECT number, link FROM channels WHERE active=1 ORDER BY number ASC"
-        ).fetchall()
+    """Return list of (number, link) tuples for active channels."""
+    docs = channels_col.find({"active": True}, {"_id": 0, "number": 1, "link": 1}).sort("number", 1)
+    return [(d["number"], d["link"]) for d in docs]
 
 def is_admin(uid: int) -> bool:
-    with db() as conn:
-        r = conn.execute("SELECT role FROM admins WHERE user_id=?", (uid,)).fetchone()
-        return r is not None
+    return admins_col.find_one({"user_id": uid}) is not None
 
 def is_owner(uid: int) -> bool:
-    with db() as conn:
-        r = conn.execute("SELECT role FROM admins WHERE user_id=?", (uid,)).fetchone()
-        return bool(r and r[0] == "owner")
+    doc = admins_col.find_one({"user_id": uid})
+    return bool(doc and doc.get("role") == "owner")
 
 def get_owner():
-    with db() as conn:
-        r = conn.execute("SELECT user_id FROM admins WHERE role='owner'").fetchone()
-        return r[0] if r else None
+    doc = admins_col.find_one({"role": "owner"})
+    return doc["user_id"] if doc else None
 
 def get_setting(key: str, default: str = "") -> str:
-    with db() as conn:
-        r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return r[0] if r else default
+    doc = settings_col.find_one({"key": key})
+    return doc["value"] if doc else default
 
 def set_setting(key: str, value: str):
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
+    settings_col.update_one({"key": key}, {"$set": {"value": value}}, upsert=True)
 
 def add_owner(uid: int):
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO admins VALUES (?,?)", (uid, "owner"))
+    admins_col.update_one({"user_id": uid}, {"$set": {"user_id": uid, "role": "owner"}}, upsert=True)
 
 def save_user(uid: int):
-    with db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?,?)",
-            (uid, datetime.now().isoformat())
-        )
+    users_col.update_one(
+        {"user_id": uid},
+        {"$setOnInsert": {"user_id": uid, "first_seen": datetime.now().isoformat()}},
+        upsert=True
+    )
 
 def build_channel_keyboard(channels, columns: int = 2):
     keyboard, row = [], []
@@ -202,10 +190,9 @@ async def is_joined_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 async def force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels = get_channels()
     keyboard = build_channel_keyboard(channels, columns=2)
-    # keyboard.append([InlineKeyboardButton("𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅", callback_data="check")])
     keyboard.append([InlineKeyboardButton(
-    "𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅",
-    url="https://t.me/+U7N9wRhh6EtmOWM1")])
+        "𝐂ʜᴇᴄᴋ 𝐉ᴏɪɴᴇᴅ ✅",
+        url="https://t.me/+U7N9wRhh6EtmOWM1")])
     markup = InlineKeyboardMarkup(keyboard)
     msg_text = get_setting("force_msg", "Join all channels first!")
     image_url = get_setting("force_image", "")
@@ -315,8 +302,11 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         n = int(context.args[0])
         l = context.args[1]
-        with db() as conn:
-            conn.execute("INSERT OR REPLACE INTO channels VALUES (?,?,1)", (n, l))
+        channels_col.update_one(
+            {"number": n},
+            {"$set": {"number": n, "link": l, "active": True}},
+            upsert=True
+        )
         await update.message.reply_text(f"Channel {n} added!")
     except Exception:
         await update.message.reply_text("Usage: /add 1 https://t.me/yourchannel")
@@ -326,8 +316,7 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         n = int(context.args[0])
-        with db() as conn:
-            conn.execute("UPDATE channels SET active=0 WHERE number=?", (n,))
+        channels_col.update_one({"number": n}, {"$set": {"active": False}})
         await update.message.reply_text(f"Channel {n} removed!")
     except Exception:
         await update.message.reply_text("Usage: /remove 1")
@@ -338,8 +327,7 @@ async def update_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         n = int(context.args[0])
         l = context.args[1]
-        with db() as conn:
-            conn.execute("UPDATE channels SET link=?, active=1 WHERE number=?", (l, n))
+        channels_col.update_one({"number": n}, {"$set": {"link": l, "active": True}})
         await update.message.reply_text(f"Channel {n} updated!")
     except Exception:
         await update.message.reply_text("Usage: /update 1 https://t.me/newlink")
@@ -395,17 +383,18 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         await update.message.reply_text("Usage: /broadcast your message")
         return
-    with db() as conn:
-        user_rows = conn.execute("SELECT user_id FROM users").fetchall()
+
+    # Fetch all saved user IDs from MongoDB
+    user_docs = users_col.find({}, {"user_id": 1, "_id": 0})
     success, fail = 0, 0
-    for (uid,) in user_rows:
+    for doc in user_docs:
         try:
-            await context.bot.send_message(chat_id=uid, text=msg)
+            await context.bot.send_message(chat_id=doc["user_id"], text=msg)
             success += 1
         except Exception:
             fail += 1
-    with db() as conn:
-        conn.execute("INSERT INTO broadcasts VALUES (?,?)", (msg, datetime.now().isoformat()))
+
+    broadcasts_col.insert_one({"message": msg, "date": datetime.now().isoformat()})
     await update.message.reply_text(f"Broadcast done!\n\nSent: {success}\nFailed: {fail}")
 
 # ================= ADMIN MANAGEMENT =================
@@ -414,8 +403,11 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid = int(context.args[0])
-        with db() as conn:
-            conn.execute("INSERT OR REPLACE INTO admins VALUES (?,?)", (uid, "admin"))
+        admins_col.update_one(
+            {"user_id": uid},
+            {"$set": {"user_id": uid, "role": "admin"}},
+            upsert=True
+        )
         await update.message.reply_text(f"Admin {uid} added!")
     except Exception:
         await update.message.reply_text("Usage: /addadmin <user_id>")
@@ -428,8 +420,7 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_owner(uid):
             await update.message.reply_text("Cannot remove owner!")
             return
-        with db() as conn:
-            conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        admins_col.delete_one({"user_id": uid})
         await update.message.reply_text(f"Admin {uid} removed!")
     except Exception:
         await update.message.reply_text("Usage: /removeadmin <user_id>")
@@ -437,8 +428,8 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    with db() as conn:
-        rows = conn.execute("SELECT user_id, role FROM admins").fetchall()
+    docs = admins_col.find({}, {"_id": 0, "user_id": 1, "role": 1})
+    rows = [(d["user_id"], d["role"]) for d in docs]
     if not rows:
         await update.message.reply_text("No admins found.")
         return
@@ -451,12 +442,10 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    with db() as conn:
-        c = conn.cursor()
-        ch = c.execute("SELECT COUNT(*) FROM channels WHERE active=1").fetchone()[0]
-        ad = c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
-        br = c.execute("SELECT COUNT(*) FROM broadcasts").fetchone()[0]
-        us = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    ch = channels_col.count_documents({"active": True})
+    ad = admins_col.count_documents({})
+    br = broadcasts_col.count_documents({})
+    us = users_col.count_documents({})
     await update.message.reply_text(
         f"*Bot Stats*\n\n"
         f"Channels: {ch}\n"
