@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from threading import Thread
@@ -10,15 +11,21 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     CallbackQueryHandler
 )
+from telegram.error import Forbidden, TelegramError
 
 from pymongo import MongoClient
 
 # ================= CONFIG =================
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_SECRET = os.getenv("OWNER_SECRET")
-MONGO_URI = os.getenv("MONGO_URI")  # e.g. mongodb+srv://user:pass@cluster.mongodb.net/botdb
-PORT = int(os.getenv("PORT", 10000))
+BOT_TOKEN     = os.getenv("BOT_TOKEN")
+OWNER_SECRET  = os.getenv("OWNER_SECRET")
+MONGO_URI     = os.getenv("MONGO_URI")
+PORT          = int(os.getenv("PORT", 10000))
+
+# Broadcast tuning — safe defaults for Render free tier (1 vCPU)
+# Telegram allows ~30 messages/sec globally; stay well under to avoid 429s
+BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", 10))   # parallel sends
+BROADCAST_CHUNK_DELAY = float(os.getenv("BROADCAST_CHUNK_DELAY", 0.05))  # seconds between chunks
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN missing in .env")
@@ -27,11 +34,15 @@ if not OWNER_SECRET:
 if not MONGO_URI:
     raise ValueError("MONGO_URI missing in .env")
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ================= MONGODB SETUP =================
-mongo_client = MongoClient(MONGO_URI)
+# maxPoolSize=10 keeps connections lean on Render free tier (512 MB RAM)
+mongo_client = MongoClient(MONGO_URI, maxPoolSize=10, serverSelectionTimeoutMS=5000)
 mongo_db = mongo_client["botdb"]
 
 channels_col   = mongo_db["channels"]
@@ -54,62 +65,316 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Bot Status</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    min-height: 100vh;
-    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-    display: flex; align-items: center; justify-content: center;
-    font-family: 'Segoe UI', sans-serif; color: white;
-  }
-  .card {
-    background: rgba(255,255,255,0.07);
-    backdrop-filter: blur(12px);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 24px;
-    padding: 50px 60px;
-    text-align: center;
-    max-width: 480px; width: 90%;
-    box-shadow: 0 30px 60px rgba(0,0,0,0.4);
-  }
-  .dot {
-    width: 16px; height: 16px;
-    background: #00ff88; border-radius: 50%;
-    display: inline-block; margin-right: 8px;
-    vertical-align: middle;
-    animation: pulse 1.5s infinite;
-  }
-  @keyframes pulse {
-    0%,100% { box-shadow: 0 0 0 0 rgba(0,255,136,0.5); }
-    50% { box-shadow: 0 0 0 10px rgba(0,255,136,0); }
-  }
-  h1 { font-size: 2.2rem; margin-bottom: 8px; letter-spacing: 1px; }
-  .sub { color: rgba(255,255,255,0.45); font-size: 0.9rem; margin-bottom: 36px; }
-  .badge {
-    display: inline-block;
-    background: rgba(0,255,136,0.12);
-    border: 1px solid rgba(0,255,136,0.35);
-    color: #00ff88;
-    border-radius: 50px;
-    padding: 10px 28px;
-    font-size: 1rem; font-weight: 600;
-    letter-spacing: 1px;
-    margin-bottom: 30px;
-  }
-  .info { color: rgba(255,255,255,0.35); font-size: 0.82rem; line-height: 1.8; }
+:root {
+  --bg: #070912;
+  --surface: #0e1120;
+  --border: #1e2540;
+  --accent: #4fffb0;
+  --accent2: #7b6ff0;
+  --text: #e8eaf6;
+  --muted: #4a5078;
+  --mono: 'Space Mono', monospace;
+  --display: 'Syne', sans-serif;
+}
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Grid background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(75,255,176,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(75,255,176,0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Glow orbs */
+.orb {
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.15;
+  pointer-events: none;
+  z-index: 0;
+}
+.orb1 { width: 400px; height: 400px; background: var(--accent2); top: -100px; left: -100px; }
+.orb2 { width: 300px; height: 300px; background: var(--accent); bottom: -80px; right: -80px; }
+
+.wrapper {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Top bar */
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 20px;
+  background: var(--surface);
+}
+.topbar-left {
+  font-family: var(--display);
+  font-size: 1.1rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+}
+.topbar-left span { color: var(--accent); }
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.pulse-dot {
+  width: 8px; height: 8px;
+  background: var(--accent);
+  border-radius: 50%;
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(79, 255, 176, 0.6); }
+  50% { box-shadow: 0 0 0 6px rgba(79, 255, 176, 0); }
+}
+
+/* Hero card */
+.hero {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  padding: 40px 36px;
+  position: relative;
+  overflow: hidden;
+}
+.hero::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), var(--accent2), transparent);
+}
+.hero-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.hero-title {
+  font-family: var(--display);
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  font-weight: 800;
+  line-height: 1.1;
+  margin-bottom: 16px;
+}
+.hero-title .accent { color: var(--accent); }
+.hero-title .accent2 { color: var(--accent2); }
+.hero-desc {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.8;
+  max-width: 480px;
+}
+
+/* Stats grid */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.stat-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+.stat-card:hover { border-color: var(--accent2); }
+.stat-icon { font-size: 1.3rem; }
+.stat-value {
+  font-family: var(--display);
+  font-size: 1.6rem;
+  font-weight: 800;
+  color: var(--accent);
+}
+.stat-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Info row */
+.info-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.info-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.info-title {
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.info-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.78rem;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.info-item:last-child { border-bottom: none; }
+.info-key { color: var(--muted); }
+.info-val { color: var(--text); }
+.badge-ok  { color: var(--accent); }
+.badge-off { color: #ff6b6b; }
+
+/* Footer */
+.footer {
+  text-align: center;
+  font-size: 0.7rem;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+  padding-top: 4px;
+}
+
+/* Uptime counter */
+#uptime { color: var(--accent2); }
+
+@media (max-width: 520px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .info-row { grid-template-columns: 1fr; }
+  .topbar-left { font-size: 0.9rem; }
+  .hero { padding: 28px 20px; }
+}
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>&#x1F916; Telegram Bot</h1>
-  <p class="sub">Powered by python-telegram-bot</p>
-  <div class="badge"><span class="dot"></span>ONLINE &amp; ACTIVE</div>
-  <p class="info">
-    Bot is running smoothly<br>
-    All systems operational<br><br>
-    &copy; 2026 &mdash; All rights reserved @aerivue
-  </p>
+<div class="orb orb1"></div>
+<div class="orb orb2"></div>
+
+<div class="wrapper">
+  <!-- Top bar -->
+  <div class="topbar">
+    <div class="topbar-left">&#x1F916; <span>AERIVUE</span> BOT</div>
+    <div class="status-pill">
+      <div class="pulse-dot"></div>
+      SYSTEM ONLINE
+    </div>
+  </div>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="hero-label">// telegram automation system</div>
+    <h1 class="hero-title">
+      <span class="accent">Force</span>&#8203;<span class="accent2">Join</span><br>
+      Bot Engine
+    </h1>
+    <p class="hero-desc">
+      Production-grade Telegram bot with async broadcast engine,
+      MongoDB persistence, and multi-admin management.<br>
+      Hosted on Render &bull; python-telegram-bot v20+
+    </p>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card">
+      <div class="stat-icon">⚡</div>
+      <div class="stat-value badge-ok">UP</div>
+      <div class="stat-label">Bot Status</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon">🗄️</div>
+      <div class="stat-value badge-ok">OK</div>
+      <div class="stat-label">Database</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon">⏱️</div>
+      <div class="stat-value" id="uptime">0s</div>
+      <div class="stat-label">Uptime</div>
+    </div>
+  </div>
+
+  <!-- Info row -->
+  <div class="info-row">
+    <div class="info-card">
+      <div class="info-title">// Runtime</div>
+      <div class="info-item"><span class="info-key">Framework</span><span class="info-val badge-ok">PTB v20</span></div>
+      <div class="info-item"><span class="info-key">Language</span><span class="info-val">Python 3.11</span></div>
+      <div class="info-item"><span class="info-key">Host</span><span class="info-val">Render</span></div>
+      <div class="info-item"><span class="info-key">DB</span><span class="info-val">MongoDB Atlas</span></div>
+    </div>
+    <div class="info-card">
+      <div class="info-title">// Features</div>
+      <div class="info-item"><span class="info-key">Force Join</span><span class="info-val badge-ok">ACTIVE</span></div>
+      <div class="info-item"><span class="info-key">Async Broadcast</span><span class="info-val badge-ok">ACTIVE</span></div>
+      <div class="info-item"><span class="info-key">Multi-Admin</span><span class="info-val badge-ok">ACTIVE</span></div>
+      <div class="info-item"><span class="info-key">Rate Limiter</span><span class="info-val badge-ok">ACTIVE</span></div>
+    </div>
+  </div>
+
+  <div class="footer">&copy; 2026 &mdash; All rights reserved &nbsp;&bull;&nbsp; @aerivue</div>
 </div>
+
+<script>
+  const start = Date.now();
+  function fmt(s) {
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+    return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  }
+  setInterval(() => {
+    document.getElementById('uptime').textContent = fmt(Math.floor((Date.now()-start)/1000));
+  }, 1000);
+</script>
 </body>
 </html>"""
 
@@ -128,7 +393,6 @@ def run_web_server():
 
 # ================= HELPERS =================
 def get_channels():
-    """Return list of (number, link) tuples for active channels."""
     docs = channels_col.find({"active": True}, {"_id": 0, "number": 1, "link": 1}).sort("number", 1)
     return [(d["number"], d["link"]) for d in docs]
 
@@ -375,7 +639,35 @@ async def set_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("force_image", url)
     await update.message.reply_text("Force image updated!")
 
-# ================= BROADCAST =================
+# ================= BROADCAST (Async, Rate-Limited) =================
+async def _send_one(bot, chat_id: int, text: str) -> bool:
+    """
+    Send a single message. Returns True on success, False on permanent failure.
+    Handles Telegram rate-limit (RetryAfter) by waiting the required time,
+    then retrying once. Silently drops users who blocked the bot (Forbidden).
+    """
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return True
+    except TelegramError as e:
+        # 429 Too Many Requests — Telegram told us exactly how long to wait
+        if hasattr(e, "retry_after") and e.retry_after:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(chat_id=chat_id, text=text)
+                return True
+            except Exception:
+                return False
+        # User blocked the bot or deleted account — skip silently
+        if isinstance(e, Forbidden):
+            return False
+        logger.warning("send_message failed for %s: %s", chat_id, e)
+        return False
+    except Exception as e:
+        logger.warning("send_message unexpected error for %s: %s", chat_id, e)
+        return False
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -384,18 +676,59 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /broadcast your message")
         return
 
-    # Fetch all saved user IDs from MongoDB
-    user_docs = users_col.find({}, {"user_id": 1, "_id": 0})
-    success, fail = 0, 0
-    for doc in user_docs:
-        try:
-            await context.bot.send_message(chat_id=doc["user_id"], text=msg)
-            success += 1
-        except Exception:
-            fail += 1
+    # Fetch all user IDs up front (cursor exhausted quickly, avoids open cursor issues)
+    user_ids = [d["user_id"] for d in users_col.find({}, {"user_id": 1, "_id": 0})]
+    total = len(user_ids)
 
-    broadcasts_col.insert_one({"message": msg, "date": datetime.now().isoformat()})
-    await update.message.reply_text(f"Broadcast done!\n\nSent: {success}\nFailed: {fail}")
+    if total == 0:
+        await update.message.reply_text("No users to broadcast to.")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"📣 Broadcasting to *{total}* users...\nThis may take a moment.",
+        parse_mode="Markdown"
+    )
+
+    # --- Semaphore-controlled concurrent sends ---
+    # BROADCAST_CONCURRENCY = 10 means at most 10 sends at the same time.
+    # Each finished send immediately starts the next — no artificial batch delays.
+    # This stays safe under Telegram's ~30 msg/s limit for bot API.
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+    async def guarded_send(uid: int) -> bool:
+        async with sem:
+            result = await _send_one(context.bot, uid, msg)
+            # Small fixed delay per send to avoid bursting all 10 at once
+            await asyncio.sleep(BROADCAST_CHUNK_DELAY)
+            return result
+
+    results = await asyncio.gather(*[guarded_send(uid) for uid in user_ids])
+
+    success = sum(results)
+    fail    = total - success
+
+    # Log to DB
+    broadcasts_col.insert_one({
+        "message": msg,
+        "date": datetime.now().isoformat(),
+        "total": total,
+        "success": success,
+        "failed": fail,
+    })
+
+    # Update the status message
+    try:
+        await status_msg.edit_text(
+            f"✅ *Broadcast Complete!*\n\n"
+            f"Total: `{total}`\n"
+            f"Sent: `{success}`\n"
+            f"Failed: `{fail}`",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text(
+            f"✅ Broadcast done!\n\nSent: {success}\nFailed: {fail}"
+        )
 
 # ================= ADMIN MANAGEMENT =================
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,23 +796,29 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("owner", owner_cmd))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_channel))
-    app.add_handler(CommandHandler("remove", remove_channel))
-    app.add_handler(CommandHandler("update", update_channel))
-    app.add_handler(CommandHandler("list", list_channels))
-    app.add_handler(CommandHandler("channels", channel_buttons))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("addadmin", add_admin))
+    app.add_handler(CommandHandler("owner",       owner_cmd))
+    app.add_handler(CommandHandler("start",       start))
+    app.add_handler(CommandHandler("add",         add_channel))
+    app.add_handler(CommandHandler("remove",      remove_channel))
+    app.add_handler(CommandHandler("update",      update_channel))
+    app.add_handler(CommandHandler("list",        list_channels))
+    app.add_handler(CommandHandler("channels",    channel_buttons))
+    app.add_handler(CommandHandler("broadcast",   broadcast))
+    app.add_handler(CommandHandler("addadmin",    add_admin))
     app.add_handler(CommandHandler("removeadmin", remove_admin))
-    app.add_handler(CommandHandler("admins", list_admins))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("setmsg", set_message))
-    app.add_handler(CommandHandler("setimage", set_image))
+    app.add_handler(CommandHandler("admins",      list_admins))
+    app.add_handler(CommandHandler("stats",       stats))
+    app.add_handler(CommandHandler("setmsg",      set_message))
+    app.add_handler(CommandHandler("setimage",    set_image))
     app.add_handler(CallbackQueryHandler(check_join, pattern="check"))
 
-    app.run_polling()
+    app.run_polling(
+        # Drop pending updates accumulated while bot was offline
+        drop_pending_updates=True,
+        # Allow up to 5 concurrent handler coroutines — safe on Render free tier
+        # (increase to 10 if you upgrade to a paid Render instance)
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 if __name__ == "__main__":
     main()
